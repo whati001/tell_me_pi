@@ -36,7 +36,11 @@ fn main() -> anyhow::Result<()> {
 
 async fn serve(cfg: Arc<Config>, api_key: Option<String>, git_token: Option<String>) -> anyhow::Result<()> {
     let token = git_token.as_deref().map(|t| (cfg.git.token_username.as_str(), t));
-    let repo = Arc::new(RepoTool::new(cfg.git.repos.clone(), cfg.sessions.mirrors_dir(), token));
+    let repo = RepoTool::new(cfg.git.repos.clone(), cfg.sessions.mirrors_dir(), token);
+    if token.is_some() {
+        check_git_env_is_private(&repo, cfg.git.insecure_allow_exposed_token).await?;
+    }
+    let repo = Arc::new(repo);
     let sessions = SessionManager::new(cfg.clone(), repo)?;
 
     let maintenance = sessions.clone();
@@ -56,6 +60,23 @@ async fn serve(cfg: Arc<Config>, api_key: Option<String>, git_token: Option<Stri
     axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
     sessions.shutdown_all().await;
     Ok(())
+}
+
+/// The agent runs as our user; if it can read a git process's environment, it can read the token.
+async fn check_git_env_is_private(repo: &RepoTool, allow_exposed: bool) -> anyhow::Result<()> {
+    if repo.git_env_is_private().await.context("checking whether git processes expose the token")? {
+        return Ok(());
+    }
+    const PROBLEM: &str = "git child processes are readable by the agent (their /proc environ is accessible), so the \
+                           git token could leak.";
+    if allow_exposed {
+        tracing::warn!("{PROBLEM} Continuing because git.insecure_allow_exposed_token is set.");
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{PROBLEM} Make the git binaries execute-only (see Dockerfile) or set git.insecure_allow_exposed_token = true \
+         for local development."
+    )
 }
 
 fn read_secret(path: Option<&Path>) -> anyhow::Result<Option<String>> {

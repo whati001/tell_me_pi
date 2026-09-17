@@ -163,11 +163,18 @@ pub struct GitConfig {
     pub token_username: String,
     #[serde(rename = "repo")]
     pub repos: Vec<RepoConfig>,
+    /// Start even though running git processes expose the token to the agent (local development only).
+    pub insecure_allow_exposed_token: bool,
 }
 
 impl Default for GitConfig {
     fn default() -> Self {
-        Self { token_file: None, token_username: "x-access-token".into(), repos: Vec::new() }
+        Self {
+            token_file: None,
+            token_username: "x-access-token".into(),
+            repos: Vec::new(),
+            insecure_allow_exposed_token: false,
+        }
     }
 }
 
@@ -287,6 +294,7 @@ mod tests {
         assert_eq!(c.omp.tools, ["read", "grep", "glob", "todo"]);
         assert_eq!(c.omp.reasoning, ReasoningMode::Field);
         assert_eq!(c.git.token_username, "x-access-token");
+        assert!(!c.git.insecure_allow_exposed_token);
         assert_eq!(c.profile("omp-codex").unwrap().model, "openai-codex/gpt-5.5");
         assert!(c.profile("nope").is_none());
     }
@@ -320,6 +328,7 @@ mod tests {
 
             [git]
             token_file = "/run/secrets/git_token"
+            insecure_allow_exposed_token = true
             [[git.repo]]
             name = "backend"
             url = "https://github.com/acme/backend.git"
@@ -331,6 +340,7 @@ mod tests {
         assert_eq!(c.sessions.retention, Duration::from_secs(7 * 24 * 3600));
         assert_eq!(c.omp.reasoning, ReasoningMode::ThinkTags);
         assert_eq!(c.repo("backend").unwrap().description, "Backend");
+        assert!(c.git.insecure_allow_exposed_token);
         assert_eq!(c.sessions.mirrors_dir(), PathBuf::from("/tmp/x/mirrors"));
     }
 

@@ -96,3 +96,124 @@ async fn rejects_bad_input() {
         .unwrap_err();
     assert!(err.to_string().contains("action=refs"), "{err}");
 }
+
+fn checkout_args(r: &str) -> serde_json::Value {
+    json!({"action": "checkout", "repo": "app", "ref": r})
+}
+
+#[tokio::test]
+async fn refs_with_slash_and_underscore_get_distinct_dirs() {
+    let root = tempfile::tempdir().unwrap();
+    let url = make_origin(root.path());
+    let origin = root.path().join("origin");
+    git(&origin, &["branch", "release/1.x", "v1.0.0"]);
+    git(&origin, &["branch", "release_1.x", "v1.1.0"]);
+    let tool = tool(root.path(), url);
+    let work = root.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let cancel = CancellationToken::new();
+    let progress = |_: &str| {};
+
+    let a = tool.execute(&work, checkout_args("release/1.x"), &progress, &cancel).await.unwrap();
+    let b = tool.execute(&work, checkout_args("release_1.x"), &progress, &cancel).await.unwrap();
+    assert!(a.contains("./app@release_2f1.x/"), "{a}");
+    assert!(b.contains("./app@release_5f1.x/"), "{b}");
+    assert_eq!(std::fs::read_to_string(work.join("app@release_2f1.x/app.txt")).unwrap(), "one");
+    assert_eq!(std::fs::read_to_string(work.join("app@release_5f1.x/app.txt")).unwrap(), "two");
+
+    let again = tool.execute(&work, checkout_args("release/1.x"), &progress, &cancel).await.unwrap();
+    assert!(again.contains("already checked out"), "{again}");
+}
+
+#[tokio::test]
+async fn checkout_again_after_workdir_was_deleted() {
+    let root = tempfile::tempdir().unwrap();
+    let tool = tool(root.path(), make_origin(root.path()));
+    let work = root.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let cancel = CancellationToken::new();
+    let progress = |_: &str| {};
+
+    tool.execute(&work, checkout_args("v1.0.0"), &progress, &cancel).await.unwrap();
+    std::fs::remove_dir_all(&work).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+    let out = tool.execute(&work, checkout_args("v1.0.0"), &progress, &cancel).await.unwrap();
+    assert!(out.contains("Checked out"), "{out}");
+    assert_eq!(std::fs::read_to_string(work.join("app@v1.0.0/app.txt")).unwrap(), "one");
+}
+
+#[tokio::test]
+async fn leftover_dir_without_marker_is_replaced() {
+    let root = tempfile::tempdir().unwrap();
+    let tool = tool(root.path(), make_origin(root.path()));
+    let work = root.path().join("work");
+    let half = work.join("app@v1.0.0");
+    std::fs::create_dir_all(half.join(".git")).unwrap();
+    std::fs::write(half.join("junk.txt"), "x").unwrap();
+    let cancel = CancellationToken::new();
+    let progress = |_: &str| {};
+
+    let out = tool.execute(&work, checkout_args("v1.0.0"), &progress, &cancel).await.unwrap();
+    assert!(out.contains("Checked out"), "{out}");
+    assert_eq!(std::fs::read_to_string(half.join("app.txt")).unwrap(), "one");
+    assert!(!half.join("junk.txt").exists());
+    assert!(work.join(".app@v1.0.0.done").exists());
+}
+
+#[tokio::test]
+async fn unknown_repo_is_rejected_before_touching_the_filesystem() {
+    let root = tempfile::tempdir().unwrap();
+    let tool = tool(root.path(), make_origin(root.path()));
+    // The work dir does not exist: any filesystem access would produce a different error.
+    let work = root.path().join("missing");
+    let cancel = CancellationToken::new();
+    let progress = |_: &str| {};
+    for repo in ["../x", "other"] {
+        let args = json!({"action": "checkout", "repo": repo, "ref": "v1.0.0"});
+        let err = tool.execute(&work, args, &progress, &cancel).await.unwrap_err();
+        assert!(err.to_string().contains("action=list"), "{err}");
+    }
+    assert!(!root.path().join("mirrors").exists());
+    assert!(!root.path().join("x@v1.0.0").exists());
+}
+
+#[tokio::test]
+async fn fetch_failure_uses_cached_mirror_with_warning() {
+    let root = tempfile::tempdir().unwrap();
+    let tool = tool(root.path(), make_origin(root.path()));
+    let work = root.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let cancel = CancellationToken::new();
+    let progress = |_: &str| {};
+    tool.execute(&work, json!({"action": "refs", "repo": "app"}), &progress, &cancel).await.unwrap();
+
+    // Break the origin and force a refetch by using a fresh tool on the same mirror.
+    std::fs::rename(root.path().join("origin"), root.path().join("gone")).unwrap();
+    let tool = self::tool(root.path(), format!("file://{}", root.path().join("origin").display()));
+    let messages = std::sync::Mutex::new(Vec::new());
+    let progress = |m: &str| messages.lock().unwrap().push(m.to_string());
+    let refs = tool.execute(&work, json!({"action": "refs", "repo": "app"}), &progress, &cancel).await.unwrap();
+    assert!(refs.starts_with("Warning: could not update app ("), "{refs}");
+    assert!(refs.contains("tag v1.1.0"), "{refs}");
+    assert!(messages.lock().unwrap().iter().any(|m| m.starts_with("fetch failed, using cached mirror")));
+}
+
+#[tokio::test]
+async fn git_env_of_readable_git_is_not_private() {
+    let root = tempfile::tempdir().unwrap();
+    let tool = tool(root.path(), make_origin(root.path()));
+    assert!(!tool.git_env_is_private().await.unwrap());
+}
+
+#[tokio::test]
+async fn git_env_of_execute_only_git_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let system_git =
+        String::from_utf8(Command::new("sh").args(["-c", "command -v git"]).output().unwrap().stdout).unwrap();
+    let copy = root.path().join("git");
+    std::fs::copy(std::fs::canonicalize(system_git.trim()).unwrap(), &copy).unwrap();
+    std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o111)).unwrap();
+    let tool = tool(root.path(), make_origin(root.path())).with_git_binary(copy);
+    assert!(tool.git_env_is_private().await.unwrap());
+}
