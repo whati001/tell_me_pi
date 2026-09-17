@@ -1,7 +1,7 @@
 use std::{path::Path, process::Command};
 
 use serde_json::json;
-use tell_me_where::{config::RepoConfig, repo::RepoTool};
+use tell_me_pi::{config::RepoConfig, repo::RepoTool};
 use tokio_util::sync::CancellationToken;
 
 fn git(dir: &Path, args: &[&str]) {

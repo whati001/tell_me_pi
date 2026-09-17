@@ -1,7 +1,7 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use serde_json::{Value, json};
-use tell_me_where::rpc::{HostToolFn, OmpProcess, PROCESS_EXIT_EVENT, SpawnSpec, ToolOutcome};
+use tell_me_pi::rpc::{HostToolFn, OmpProcess, PROCESS_EXIT_EVENT, SpawnSpec, ToolOutcome};
 use tokio::sync::broadcast;
 
 fn spec(dir: &tempfile::TempDir) -> SpawnSpec {

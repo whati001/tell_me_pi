@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::Context;
-use tell_me_where::{
+use tell_me_pi::{
     api::{self, AppState},
     config::Config,
     repo::RepoTool,

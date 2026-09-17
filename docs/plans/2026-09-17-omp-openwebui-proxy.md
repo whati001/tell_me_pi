@@ -71,7 +71,7 @@ read-only `repo` tool (list/refs/checkout), and ships as a hardened Docker Compo
 
 ```toml
 [package]
-name = "tell_me_where"
+name = "tell_me_pi"
 version = "0.1.0"
 edition = "2024"
 
@@ -945,7 +945,7 @@ Spawns `omp --mode rpc` and handles the stdio protocol:
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use serde_json::{Value, json};
-use tell_me_where::rpc::{HostToolFn, OmpProcess, PROCESS_EXIT_EVENT, SpawnSpec, ToolOutcome};
+use tell_me_pi::rpc::{HostToolFn, OmpProcess, PROCESS_EXIT_EVENT, SpawnSpec, ToolOutcome};
 use tokio::sync::broadcast;
 
 fn spec(dir: &tempfile::TempDir) -> SpawnSpec {
@@ -1037,7 +1037,7 @@ async fn crash_is_reported_as_process_exit() {
 **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test --test rpc_process`
-Expected: compile errors (`tell_me_where::rpc::OmpProcess` not found).
+Expected: compile errors (`tell_me_pi::rpc::OmpProcess` not found).
 
 **Step 3: Write the implementation**
 
@@ -1442,7 +1442,7 @@ is required for the blobless clone.
 use std::{path::Path, process::Command};
 
 use serde_json::json;
-use tell_me_where::{config::RepoConfig, repo::RepoTool};
+use tell_me_pi::{config::RepoConfig, repo::RepoTool};
 use tokio_util::sync::CancellationToken;
 
 fn git(dir: &Path, args: &[&str]) {
@@ -2423,7 +2423,7 @@ through the fake omp.
 use std::{sync::Arc, time::Duration};
 
 use serde_json::{Value, json};
-use tell_me_where::{
+use tell_me_pi::{
     api::{self, AppState},
     config::{Config, RepoConfig},
     repo::RepoTool,
@@ -2736,7 +2736,7 @@ async fn delete_session_removes_state() {
 **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test --test api`
-Expected: compile errors (`tell_me_where::api`, `session` not found).
+Expected: compile errors (`tell_me_pi::api`, `session` not found).
 
 **Step 3: Implement the session manager**
 
@@ -3526,7 +3526,7 @@ use std::{
 };
 
 use anyhow::Context;
-use tell_me_where::{
+use tell_me_pi::{
     api::{self, AppState},
     config::Config,
     repo::RepoTool,
@@ -3816,12 +3816,12 @@ tests
 **Step 4: `docker-compose.yml`**
 
 ```yaml
-name: tell-me-where
+name: tell-me-pi
 
 services:
   omp-proxy:
     build: .
-    image: tell-me-where/omp-proxy:latest
+    image: tell-me-pi/omp-proxy:latest
     restart: unless-stopped
     read_only: true
     tmpfs:
@@ -3911,7 +3911,7 @@ cp proxy.example.toml proxy.toml && cp .env.example .env
 mkdir -p secrets && printf x > secrets/git_token && printf change-me > secrets/proxy_api_key
 docker compose config -q && echo OK
 docker compose build omp-proxy
-docker run --rm --entrypoint omp tell-me-where/omp-proxy:latest --version
+docker run --rm --entrypoint omp tell-me-pi/omp-proxy:latest --version
 ```
 Expected:
 - `OK`, then a successful build;
@@ -3946,7 +3946,7 @@ git commit -m "feat: add Docker image and compose deployment with OpenWebUI"
 **Step 1: Write `README.md`**
 
 ````markdown
-# tell_me_where — omp agent behind OpenWebUI
+# tell_me_pi — omp agent behind OpenWebUI
 
 `omp-proxy` is an OpenAI-compatible server (`/v1/models`, `/v1/chat/completions`) that runs the
 [oh-my-pi](https://github.com/can1357/oh-my-pi) coding agent (`omp --mode rpc`) for each

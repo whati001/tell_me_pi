@@ -1,9 +1,9 @@
-name: tell-me-where
+name: tell-me-pi
 
 services:
   omp-proxy:
     build: .
-    image: tell-me-where/omp-proxy:latest
+    image: tell-me-pi/omp-proxy:latest
     restart: unless-stopped
     stop_grace_period: 30s   # lets the proxy stop its omp processes cleanly
     read_only: true

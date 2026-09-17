@@ -1,4 +1,4 @@
-# tell_me_where — omp agent behind OpenWebUI
+# tell_me_pi — omp agent behind OpenWebUI
 
 `omp-proxy` is an OpenAI-compatible server (`/v1/models`, `/v1/chat/completions`) that runs the
 [oh-my-pi](https://github.com/can1357/oh-my-pi) coding agent (`omp --mode rpc`) for each

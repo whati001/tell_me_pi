@@ -3,7 +3,7 @@
 use std::{sync::Arc, time::Duration};
 
 use serde_json::{Value, json};
-use tell_me_where::{
+use tell_me_pi::{
     api::{self, AppState},
     config::{Config, RepoConfig},
     repo::RepoTool,
