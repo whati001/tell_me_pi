@@ -88,3 +88,33 @@ async fn crash_is_reported_as_process_exit() {
     assert_eq!(events.last().unwrap()["type"], PROCESS_EXIT_EVENT);
     assert!(!proc.is_alive());
 }
+
+#[tokio::test]
+async fn panicking_host_tool_reports_an_error_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let handler: HostToolFn = Arc::new(|_call| Box::pin(async move { panic!("handler exploded") }));
+    let proc = OmpProcess::spawn(spec(&dir), Some(handler)).await.unwrap();
+    let mut rx = proc.subscribe();
+    proc.request(json!({"type": "prompt", "message": "USE_TOOL"})).await.unwrap();
+    let events = collect_until_end(&mut rx).await;
+    assert_eq!(text_of(&events), "tool said: host tool failed unexpectedly");
+    let end = events.iter().find(|e| e["type"] == "tool_execution_end").unwrap();
+    assert_eq!(end["isError"], true);
+}
+
+#[tokio::test]
+async fn corrupt_stream_is_fatal() {
+    let dir = tempfile::tempdir().unwrap();
+    let proc = OmpProcess::spawn(spec(&dir), None).await.unwrap();
+    let mut rx = proc.subscribe();
+    proc.request(json!({"type": "prompt", "message": "CORRUPT"})).await.unwrap();
+    let events = collect_until_end(&mut rx).await;
+    assert_eq!(events.last().unwrap()["type"], PROCESS_EXIT_EVENT);
+    assert!(!events.iter().any(|e| e["type"] == "agent_start"), "{events:?}");
+    assert!(!proc.is_alive());
+    let err = tokio::time::timeout(Duration::from_secs(5), proc.request(json!({"type": "get_state"})))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(err.to_string().contains("not running"), "{err}");
+}

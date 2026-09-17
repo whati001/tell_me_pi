@@ -8,6 +8,8 @@
 //! - `EXT_UI`: sends a confirm dialog and echoes whether it was cancelled
 //! - `FAIL_LATE`: acknowledges the prompt, then fails it with a second response (like a missing login)
 //! - `BIG`: sends a 5000 character text delta as `rpc_chunk` frames (v2 only)
+//! - `CORRUPT`: sends the first `rpc_chunk` of a two-chunk sequence, then carries on normally (an
+//!   `agent_start` frame interrupts the sequence, which corrupts the stream)
 //!
 //! Every invocation appends its argv as a JSON line to `<session-dir>/../args.log`.
 
@@ -146,6 +148,10 @@ impl Fake {
 
         if message.contains("CRASH") {
             std::process::exit(3);
+        }
+        if message.contains("CORRUPT") {
+            out(&json!({"type": "rpc_chunk", "chunkId": "bad", "index": 0, "count": 2, "byteLength": 4,
+                        "data": STANDARD.encode("{}")}));
         }
         out(&json!({"type": "agent_start"}));
 

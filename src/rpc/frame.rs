@@ -9,7 +9,12 @@ pub enum FrameError {
     Json(#[from] serde_json::Error),
     #[error("invalid rpc_chunk: {0}")]
     Chunk(String),
+    #[error("frame must be a JSON object")]
+    NotObject,
 }
+
+/// Upper bound on `rpc_chunk.count`, so a corrupt header cannot announce an endless sequence.
+const MAX_CHUNKS: u64 = 4096;
 
 struct Pending {
     chunk_id: String,
@@ -30,12 +35,18 @@ impl FrameDecoder {
     }
 
     /// Feeds one stdout line. Returns `Some(frame)` once a complete logical frame is available.
+    ///
+    /// An `Err` means the stream is corrupt: the caller must not trust anything it reads afterwards.
     pub fn push_line(&mut self, line: &str) -> Result<Option<Value>, FrameError> {
         let line = line.trim();
         if line.is_empty() {
             return Ok(None);
         }
         let value: Value = serde_json::from_str(line)?;
+        if !value.is_object() {
+            self.pending = None;
+            return Err(FrameError::NotObject);
+        }
         if value["type"] != "rpc_chunk" {
             if self.pending.take().is_some() {
                 return Err(FrameError::Chunk("chunk sequence interrupted by another frame".into()));
@@ -56,14 +67,18 @@ impl FrameDecoder {
         let chunk_id = v["chunkId"].as_str().ok_or_else(|| bad("missing chunkId"))?;
         let index = v["index"].as_u64().ok_or_else(|| bad("missing index"))?;
         let count = v["count"].as_u64().ok_or_else(|| bad("missing count"))?;
-        let byte_length = v["byteLength"].as_u64().ok_or_else(|| bad("missing byteLength"))? as usize;
+        let byte_length = v["byteLength"].as_u64().ok_or_else(|| bad("missing byteLength"))?;
+        let byte_length = usize::try_from(byte_length).map_err(|_| bad("byteLength too large"))?;
         let data = v["data"].as_str().ok_or_else(|| bad("missing data"))?;
+        if data.is_empty() {
+            return Err(bad("empty data"));
+        }
 
         if index == 0 {
             if self.pending.is_some() {
                 return Err(bad("new chunk sequence started before the previous one finished"));
             }
-            if count == 0 || byte_length > self.max_bytes {
+            if count == 0 || count > MAX_CHUNKS || byte_length > self.max_bytes {
                 return Err(bad("invalid count or frame too large"));
             }
             self.pending = Some(Pending {
@@ -92,7 +107,14 @@ impl FrameDecoder {
             return Err(bad("reassembled length mismatch"));
         }
         let text = String::from_utf8(p.buf).map_err(|_| bad("reassembled frame is not UTF-8"))?;
-        Ok(Some(serde_json::from_str(&text)?))
+        let frame: Value = serde_json::from_str(&text)?;
+        if !frame.is_object() {
+            return Err(FrameError::NotObject);
+        }
+        if frame["type"] == "rpc_chunk" {
+            return Err(bad("reassembled frame is itself an rpc_chunk"));
+        }
+        Ok(Some(frame))
     }
 }
 
@@ -147,6 +169,46 @@ mod tests {
 
         let mut d = FrameDecoder::new(1 << 20);
         assert!(d.push_line(&lines[1]).is_err());
+    }
+
+    fn chunk(index: u64, count: u64, byte_length: u64, data: &str) -> String {
+        json!({"type": "rpc_chunk", "chunkId": "c", "index": index, "count": count,
+               "byteLength": byte_length, "data": data})
+        .to_string()
+    }
+
+    #[test]
+    fn rejects_plain_frames_that_are_not_objects() {
+        for line in ["[1]", "\"agent_start\"", "3", "null"] {
+            let mut d = FrameDecoder::new(1024);
+            assert!(matches!(d.push_line(line), Err(FrameError::NotObject)), "{line}");
+        }
+    }
+
+    #[test]
+    fn rejects_reassembled_frames_that_are_not_objects_or_are_chunks() {
+        let mut d = FrameDecoder::new(1 << 20);
+        let lines = chunks("c1", &json!([1, 2, 3]), 2);
+        d.push_line(&lines[0]).unwrap();
+        assert!(matches!(d.push_line(&lines[1]), Err(FrameError::NotObject)));
+
+        let mut d = FrameDecoder::new(1 << 20);
+        let nested =
+            json!({"type": "rpc_chunk", "chunkId": "x", "index": 0, "count": 1, "byteLength": 2, "data": "e30="});
+        let lines = chunks("c2", &nested, 2);
+        d.push_line(&lines[0]).unwrap();
+        assert!(matches!(d.push_line(&lines[1]), Err(FrameError::Chunk(_))));
+    }
+
+    #[test]
+    fn rejects_too_many_chunks_and_empty_data() {
+        let mut d = FrameDecoder::new(1 << 20);
+        assert!(d.push_line(&chunk(0, 4097, 10, "e30=")).is_err());
+        let mut d = FrameDecoder::new(1 << 20);
+        assert!(d.push_line(&chunk(0, 4096, 10, "e30=")).is_ok());
+
+        let mut d = FrameDecoder::new(1 << 20);
+        assert!(d.push_line(&chunk(0, 2, 10, "")).is_err());
     }
 
     #[test]

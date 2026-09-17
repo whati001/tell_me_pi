@@ -3,6 +3,7 @@
 
 use std::{
     collections::HashMap,
+    panic::AssertUnwindSafe,
     path::PathBuf,
     process::Stdio,
     sync::{
@@ -13,7 +14,7 @@ use std::{
 };
 
 use anyhow::{Context, anyhow, bail};
-use futures::future::BoxFuture;
+use futures::{FutureExt, future::BoxFuture};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -78,7 +79,7 @@ pub struct OmpProcess {
     events: broadcast::Sender<Value>,
     next_id: AtomicU64,
     alive: Arc<AtomicBool>,
-    child: Mutex<Option<Child>>,
+    child: Arc<Mutex<Option<Child>>>,
 }
 
 impl OmpProcess {
@@ -123,6 +124,20 @@ impl OmpProcess {
         let pending: PendingMap = Arc::default();
         let alive = Arc::new(AtomicBool::new(true));
         let (ready_tx, ready_rx) = oneshot::channel();
+        let child = Arc::new(Mutex::new(Some(child)));
+
+        // Kills the child when the reader finds its output corrupt. Holds only a weak reference, so dropping
+        // `OmpProcess` still drops (and, via `kill_on_drop`, kills) the child; the task ends when the reader does.
+        let (fatal_tx, fatal_rx) = oneshot::channel::<()>();
+        let weak_child = Arc::downgrade(&child);
+        tokio::spawn(async move {
+            if fatal_rx.await.is_ok()
+                && let Some(child) = weak_child.upgrade()
+                && let Some(child) = child.lock().await.as_mut()
+            {
+                let _ = child.start_kill();
+            }
+        });
 
         let reader = Reader {
             events: events.clone(),
@@ -132,18 +147,11 @@ impl OmpProcess {
             host_tool,
             host_calls: Arc::default(),
             ready_tx: Some(ready_tx),
+            fatal_tx: Some(fatal_tx),
         };
         tokio::spawn(reader.run(stdout));
 
-        let proc = Arc::new(Self {
-            stdin_tx,
-            close,
-            pending,
-            events,
-            next_id: AtomicU64::new(1),
-            alive,
-            child: Mutex::new(Some(child)),
-        });
+        let proc = Arc::new(Self { stdin_tx, close, pending, events, next_id: AtomicU64::new(1), alive, child });
 
         let ready = tokio::time::timeout(READY_TIMEOUT, ready_rx)
             .await
@@ -156,6 +164,8 @@ impl OmpProcess {
         Ok(proc)
     }
 
+    /// Subscribes to omp events. Only events sent after this call are received, so subscribe before sending
+    /// the command whose events you need.
     pub fn subscribe(&self) -> broadcast::Receiver<Value> {
         self.events.subscribe()
     }
@@ -206,7 +216,10 @@ impl OmpProcess {
     /// Closes stdin, waits up to `grace` for a clean exit, then kills the child.
     pub async fn shutdown(&self, grace: Duration) {
         self.close.cancel();
-        let Some(mut child) = self.child.lock().await.take() else { return };
+        let Some(mut child) = self.child.lock().await.take() else {
+            self.alive.store(false, Ordering::SeqCst);
+            return;
+        };
         if tokio::time::timeout(grace, child.wait()).await.is_err() {
             let _ = child.kill().await;
         }
@@ -222,6 +235,8 @@ struct Reader {
     host_tool: Option<HostToolFn>,
     host_calls: Arc<std::sync::Mutex<HashMap<String, CancellationToken>>>,
     ready_tx: Option<oneshot::Sender<Value>>,
+    /// Asks the supervisor task to kill the child after a fatal read error.
+    fatal_tx: Option<oneshot::Sender<()>>,
 }
 
 impl Reader {
@@ -229,18 +244,23 @@ impl Reader {
         let mut lines = BufReader::new(stdout).lines();
         let mut decoder = FrameDecoder::new(MAX_REASSEMBLED_BYTES);
         loop {
-            match lines.next_line().await {
+            let error = match lines.next_line().await {
                 Ok(Some(line)) => match decoder.push_line(&line) {
-                    Ok(Some(frame)) => self.dispatch(frame).await,
-                    Ok(None) => {}
-                    Err(e) => tracing::warn!("dropping bad omp frame: {e}"),
+                    Ok(Some(frame)) => {
+                        self.dispatch(frame).await;
+                        continue;
+                    }
+                    Ok(None) => continue,
+                    Err(e) => format!("omp sent a corrupt frame: {e}"),
                 },
                 Ok(None) => break,
-                Err(e) => {
-                    tracing::warn!("reading omp stdout failed: {e}");
-                    break;
-                }
+                Err(e) => format!("reading omp stdout failed: {e}"),
+            };
+            tracing::error!("{error}; killing omp");
+            if let Some(tx) = self.fatal_tx.take() {
+                let _ = tx.send(());
             }
+            break;
         }
         self.alive.store(false, Ordering::SeqCst);
         self.pending.lock().await.clear();
@@ -314,8 +334,12 @@ impl Reader {
             cancel,
         };
         tokio::spawn(async move {
-            let outcome = handler(call).await;
+            let outcome = AssertUnwindSafe(async move { handler(call).await }).catch_unwind().await;
             host_calls.lock().expect("host_calls poisoned").remove(&id);
+            let outcome = outcome.unwrap_or_else(|_| {
+                tracing::error!("host tool handler panicked");
+                ToolOutcome { text: "host tool failed unexpectedly".into(), is_error: true }
+            });
             let _ = stdin_tx.send(tool_result(&id, &outcome.text, outcome.is_error));
         });
     }
