@@ -217,3 +217,25 @@ async fn git_env_of_execute_only_git_is_private() {
     let tool = tool(root.path(), make_origin(root.path())).with_git_binary(copy);
     assert!(tool.git_env_is_private().await.unwrap());
 }
+
+#[tokio::test]
+async fn checkout_recovers_from_missing_but_locked_worktree() {
+    let root = tempfile::tempdir().unwrap();
+    let tool = tool(root.path(), make_origin(root.path()));
+    let work = root.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let cancel = CancellationToken::new();
+    let progress = |_: &str| {};
+
+    tool.execute(&work, checkout_args("v1.0.0"), &progress, &cancel).await.unwrap();
+    // What a killed `git worktree add` leaves behind: a locked worktree entry whose directory is gone.
+    let target = work.join("app@v1.0.0");
+    let mirror = root.path().join("mirrors/app.git");
+    git(root.path(), &["--git-dir", mirror.to_str().unwrap(), "worktree", "lock", target.to_str().unwrap()]);
+    std::fs::remove_dir_all(&target).unwrap();
+    std::fs::remove_file(work.join(".app@v1.0.0.done")).unwrap();
+
+    let out = tool.execute(&work, checkout_args("v1.0.0"), &progress, &cancel).await.unwrap();
+    assert!(out.contains("Checked out"), "{out}");
+    assert_eq!(std::fs::read_to_string(target.join("app.txt")).unwrap(), "one");
+}

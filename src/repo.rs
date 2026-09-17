@@ -75,27 +75,45 @@ impl RepoTool {
     /// the same user, i.e. whether `/proc/<pid>/environ` of a running git is unreadable. That is the case when
     /// the git binary is execute-only: the kernel then marks the process non-dumpable.
     pub async fn git_env_is_private(&self) -> anyhow::Result<bool> {
+        // `hash-object --stdin` waits for stdin even outside a repository, so the probe reads the environment of a
+        // live git rather than of a zombie (whose environ may be readable regardless). The cwd is set explicitly so
+        // the result does not depend on where the proxy runs.
         let mut child = Command::new(&self.git)
-            .args(["cat-file", "--batch"])
+            .args(["hash-object", "--stdin"])
+            .current_dir(std::env::temp_dir())
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("OMP_PROXY_PROBE", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("spawning {}", self.git.display()))?;
         // `spawn` returns after the exec succeeded, so this reads the environment of git itself.
-        let result = match child.id() {
-            Some(pid) => match tokio::fs::read(format!("/proc/{pid}/environ")).await {
+        let read = match child.id() {
+            Some(pid) => tokio::fs::read(format!("/proc/{pid}/environ")).await,
+            None => Err(std::io::Error::other("no pid")),
+        };
+        // Only trust the result if git was still running while it was read.
+        let result = match child.try_wait() {
+            Ok(None) => match read {
                 Ok(_) => Ok(false),
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Ok(true),
                 Err(e) => Err(anyhow::Error::new(e).context("reading the environment of a git process")),
             },
-            None => Err(anyhow::anyhow!("git exited immediately")),
+            Ok(Some(status)) => {
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    use tokio::io::AsyncReadExt;
+                    let _ = pipe.read_to_string(&mut stderr).await;
+                }
+                Err(anyhow::anyhow!("git probe exited early ({status}): {}", stderr.trim()))
+            }
+            Err(e) => Err(anyhow::Error::new(e).context("checking the git probe")),
         };
         drop(child.stdin.take());
+        drop(child.stderr.take());
         if tokio::time::timeout(Duration::from_secs(5), child.wait()).await.is_err() {
             let _ = child.kill().await;
         }
@@ -231,7 +249,9 @@ impl RepoTool {
         }
         let target_str = target.to_str().context("working directory is not valid UTF-8")?;
         self.git(Some(&mirror), &["worktree", "prune"], cancel).await?;
-        self.git(Some(&mirror), &["worktree", "add", "--detach", target_str, &commit], cancel).await?;
+        // `-f -f`: a killed `worktree add` leaves its entry locked ("initializing"), which `prune` skips and a
+        // plain `add` refuses forever ("missing but locked worktree"). Forcing is safe: the target was just removed.
+        self.git(Some(&mirror), &["worktree", "add", "--detach", "-f", "-f", target_str, &commit], cancel).await?;
         tokio::fs::write(&marker, &commit).await.context("writing checkout marker")?;
         Ok(format!(
             "{warning}Checked out {name} {git_ref} ({}) into ./{dir_name}/. Use read, grep and glob on paths under \
