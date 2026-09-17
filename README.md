@@ -1,9 +1,7 @@
-# tell_me_pi — omp agent behind OpenWebUI
+# Tell Me Pi — Coding Agent for the PM and Support
 
-`omp-proxy` is an OpenAI-compatible server (`/v1/models`, `/v1/chat/completions`) that runs the
-[oh-my-pi](https://github.com/can1357/oh-my-pi) coding agent (`omp --mode rpc`) for each
-[OpenWebUI](https://github.com/open-webui/open-webui) chat. The agent is read-only. It can check out
-releases of the configured repositories with its `repo` tool and answer questions about them.
+This project aims to provide a interface for the product management and the support team to ask questions about a code base. 
+The idea is to use a coding harness ([oh-my-pi](https://github.com/can1357/oh-my-pi) in this case) and expose it as a legitimate OpenAI-compatible server (`/v1/models`, `/v1/chat/completions`) through [OpenWebUI](https://github.com/open-webui/open-webui) web ui to the teams. The agent is read-only and can checkout the project code via a custom tool called `repo`, which allows to fetch and navigate in the source tree. Everything else is blocked, no `bash`, `read`, `write`, etc.
 
 Design: [`docs/plans/2026-09-17-omp-openwebui-proxy-design.md`](docs/plans/2026-09-17-omp-openwebui-proxy-design.md)
 
