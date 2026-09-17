@@ -37,7 +37,8 @@ token_username = "x-access-token"   # GitLab: "oauth2"
 # Only for local development without execute-only git binaries.
 insecure_allow_exposed_token = false
 
-# https://, http:// or file:// urls without embedded credentials.
+# https://, http:// or file:// urls without embedded credentials. http:// is rejected while
+# token_file is set (the token would be sent in cleartext).
 [[git.repo]]
 name = "backend"
 url = "https://github.com/acme/backend.git"

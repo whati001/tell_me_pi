@@ -12,7 +12,7 @@
 //!   `agent_start` frame interrupts the sequence, which corrupts the stream)
 //!
 //! `get_state` reports the `--tools` list plus the registered host tools as `dumpTools`; with
-//! `--model fake/leaky` it also reports `bash`.
+//! `--model fake/leaky` it also reports `bash`; with `--model fake/notools` it omits `dumpTools`.
 //!
 //! Every invocation appends its argv as a JSON line to `<session-dir>/../args.log`.
 
@@ -33,6 +33,7 @@ struct Fake {
     next_entry: u64,
     v2: bool,
     tools: Vec<String>,
+    report_tools: bool,
 }
 
 fn main() {
@@ -49,8 +50,16 @@ fn main() {
     if arg("--model").as_deref() == Some("fake/leaky") {
         tools.push("bash".into());
     }
-    let mut fake =
-        Fake { session_dir, session_file: PathBuf::new(), entries: Vec::new(), next_entry: 1, v2: false, tools };
+    let report_tools = arg("--model").as_deref() != Some("fake/notools");
+    let mut fake = Fake {
+        session_dir,
+        session_file: PathBuf::new(),
+        entries: Vec::new(),
+        next_entry: 1,
+        v2: false,
+        tools,
+        report_tools,
+    };
     match arg("--resume") {
         Some(path) => {
             fake.session_file = PathBuf::from(&path);
@@ -115,11 +124,12 @@ impl Fake {
             }
             "get_state" => {
                 let tools: Vec<Value> = self.tools.iter().map(|name| json!({"name": name})).collect();
-                ok(
-                    cmd,
-                    json!({"sessionFile": self.session_file, "isStreaming": false,
-                           "messageCount": self.entries.len(), "dumpTools": tools}),
-                )
+                let mut state = json!({"sessionFile": self.session_file, "isStreaming": false,
+                                       "messageCount": self.entries.len(), "dumpTools": tools});
+                if !self.report_tools {
+                    state.as_object_mut().unwrap().remove("dumpTools");
+                }
+                ok(cmd, state)
             }
             "get_branch_messages" => {
                 let messages: Vec<Value> =

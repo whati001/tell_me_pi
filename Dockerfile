@@ -36,6 +36,6 @@ ENV HOME=/data/home \
     OMP_PROXY_USER=omp
 VOLUME ["/data"]
 EXPOSE 8080
-HEALTHCHECK --interval=30s --timeout=5s CMD curl -fsS http://127.0.0.1:8080/healthz || exit 1
+HEALTHCHECK --start-period=5s --interval=10s --timeout=5s CMD curl -fsS http://127.0.0.1:8080/healthz || exit 1
 # Starts as root to read the secrets, then drops to the omp user.
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/omp-proxy"]

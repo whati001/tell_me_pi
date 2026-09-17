@@ -131,6 +131,8 @@ impl SessionManager {
             // The user moved on (stop + new message, regenerate, …): cancel the running turn first.
             st.turn_cancel.cancel();
             st.busy = false;
+            // The superseded turn's `end_turn` must not touch the state from now on, even if this request fails.
+            st.generation += 1;
             if let Some(proc) = st.proc.clone()
                 && proc.is_alive()
                 && let Err(e) = stop_turn(&proc).await
@@ -257,9 +259,13 @@ impl SessionManager {
             tracing::warn!(key = %session.key, "omp did not respond after the turn, stopping it: {e:#}");
             proc.shutdown(SHUTDOWN_GRACE).await;
         }
+        // Only clear the slot if it still holds this turn's process (never a newer one).
+        let current = st.proc.as_ref().is_some_and(|p| Arc::ptr_eq(p, &proc));
         if !proc.is_alive() {
-            st.proc = None;
-        } else if self.cfg.sessions.idle_timeout.is_zero() {
+            if current {
+                st.proc = None;
+            }
+        } else if self.cfg.sessions.idle_timeout.is_zero() && current {
             proc.shutdown(SHUTDOWN_GRACE).await;
             st.proc = None;
         }
@@ -330,12 +336,11 @@ impl SessionManager {
     }
 
     pub async fn shutdown_all(&self) {
+        let mut procs = Vec::new();
         for session in self.all_sessions().await {
-            let proc = session.state.lock().await.proc.take();
-            if let Some(proc) = proc {
-                proc.shutdown(SHUTDOWN_GRACE).await;
-            }
+            procs.extend(session.state.lock().await.proc.take());
         }
+        futures::future::join_all(procs.iter().map(|proc| proc.shutdown(SHUTDOWN_GRACE))).await;
     }
 
     pub async fn live_count(&self) -> usize {
@@ -503,7 +508,7 @@ impl SessionManager {
             .iter()
             .copied()
             .chain(omp.env_passthrough.iter().map(String::as_str))
-            .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
+            .filter_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()).map(|v| (k.to_string(), v)))
             .collect();
 
         let repo = self.repo.clone();
@@ -543,10 +548,9 @@ impl SessionManager {
     async fn configure(&self, proc: &OmpProcess) -> anyhow::Result<Value> {
         control(proc, json!({"type": "set_host_tools", "tools": [self.repo.definition()]})).await?;
         let state = control(proc, json!({"type": "get_state"})).await?;
-        let unexpected: Vec<&str> = state["data"]["dumpTools"]
-            .as_array()
-            .into_iter()
-            .flatten()
+        let tools = state["data"]["dumpTools"].as_array().context("omp did not report its active tools")?;
+        let unexpected: Vec<&str> = tools
+            .iter()
             .map(|t| t["name"].as_str().unwrap_or("<unnamed>"))
             .filter(|name| *name != TOOL_NAME && !config::ALLOWED_TOOLS.contains(name))
             .collect();

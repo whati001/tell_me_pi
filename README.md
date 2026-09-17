@@ -37,6 +37,9 @@ Design: [`docs/plans/2026-09-17-omp-openwebui-proxy-design.md`](docs/plans/2026-
    sudo chown 0:0 secrets/* && sudo chmod 600 secrets/*          # only root in the container can read them
    ```
 
+   `chown 0:0` assumes rootful Docker without userns-remap; otherwise chown the files to the host
+   uid that the container's root is mapped to.
+
    Use a read-only token, e.g. a GitHub fine-grained PAT with only *Contents: read* on the
    configured repositories.
 
@@ -48,6 +51,10 @@ Design: [`docs/plans/2026-09-17-omp-openwebui-proxy-design.md`](docs/plans/2026-
    docker compose run --rm -it --user omp --entrypoint omp omp-proxy
    # inside omp: /login  → choose OpenAI Codex (ChatGPT) → follow the browser flow → /exit
    ```
+
+   `-it` is required: omp is interactive here. After you authorize in the browser, the redirect to
+   `localhost:1455` fails to load (nothing listens there on your machine). Copy that full URL from
+   the browser's address bar and paste it into omp when it asks for it.
 
 3. Start:
 
@@ -106,7 +113,8 @@ proxy then still recognises follow-up messages as continuing the same history.
 - git runs from execute-only binaries, so the kernel marks git processes (which receive the token
   in their environment) non-dumpable and the agent cannot read their `/proc/<pid>/environ`. The
   proxy verifies this at startup and refuses to use the token otherwise.
-- Repository URLs must be `https://`, `http://` or `file://` without embedded credentials.
+- Repository URLs must be `https://`, `http://` or `file://` without embedded credentials;
+  `http://` is rejected when a git token is configured.
 - The container runs with:
   - a read-only root filesystem;
   - no capabilities except `SETUID`/`SETGID`;

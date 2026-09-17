@@ -219,6 +219,9 @@ impl Config {
                     bail!("profile {field} {value:?} must be non-empty and must not start with '-'");
                 }
             }
+            if p.name.contains(':') {
+                bail!("profile name {:?} must not contain ':'", p.name);
+            }
             if !names.insert(&p.name) {
                 bail!("duplicate profile name {:?}", p.name);
             }
@@ -252,6 +255,13 @@ impl Config {
             if !is_valid_repo_url(&r.url) {
                 bail!(
                     "invalid url for repo {:?}: use an https://, http:// or file:// url without embedded credentials",
+                    r.name
+                );
+            }
+            if self.git.token_file.is_some() && r.url.starts_with("http://") {
+                bail!(
+                    "repo {:?} uses http:// while git.token_file is set: the token would be sent in cleartext; use \
+                     https://",
                     r.name
                 );
             }
@@ -397,6 +407,22 @@ mod tests {
         assert!(Config::from_toml("[[profile]]\nname = \"a\"\nmodel = \"\"\n").is_err());
         assert!(Config::from_toml("[[profile]]\nname = \"a\"\nmodel = \"--tools=bash\"\n").is_err());
         assert!(Config::from_toml("[[profile]]\nname = \"-a\"\nmodel = \"m\"\n").is_err());
+    }
+
+    #[test]
+    fn rejects_http_repo_urls_with_a_token() {
+        let repo = "[[git.repo]]\nname = \"x\"\nurl = \"http://host/x.git\"\n";
+        let err = Config::from_toml(&format!("{MINIMAL}\n[git]\ntoken_file = \"/t\"\n{repo}")).unwrap_err();
+        assert!(err.to_string().contains("cleartext"), "{err}");
+        let https = repo.replace("http://", "https://");
+        Config::from_toml(&format!("{MINIMAL}\n[git]\ntoken_file = \"/t\"\n{https}")).unwrap();
+        Config::from_toml(&format!("{MINIMAL}\n{repo}")).unwrap();
+    }
+
+    #[test]
+    fn rejects_colons_in_profile_names() {
+        let err = Config::from_toml("[[profile]]\nname = \"a:b\"\nmodel = \"m\"\n").unwrap_err();
+        assert!(err.to_string().contains("':'"), "{err}");
     }
 
     #[test]

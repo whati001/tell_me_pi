@@ -36,6 +36,10 @@ async fn start(extra_sessions_config: &str) -> Server {
         [[profile]]
         name = "omp-leaky"
         model = "fake/leaky"
+
+        [[profile]]
+        name = "omp-notools"
+        model = "fake/notools"
         "#,
         data = data.path().display(),
         bin = env!("CARGO_BIN_EXE_fake-omp"),
@@ -395,5 +399,24 @@ async fn tools_outside_the_read_only_set_are_refused() {
     let body: Value = resp.json().await.unwrap();
     let message = body["error"]["message"].as_str().unwrap();
     assert!(message.contains("read-only set") && message.contains("bash"), "{message}");
+    assert_eq!(s.sessions.live_count().await, 0);
+}
+
+#[tokio::test]
+async fn omp_without_tool_report_is_refused() {
+    let s = start("").await;
+    let resp = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.url))
+        .bearer_auth("secret")
+        .header("X-OpenWebUI-Chat-Id", "notools")
+        .json(&json!({"model": "omp-notools", "messages": [user("hi")]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
+    let body: Value = resp.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("did not report its active tools"), "{message}");
     assert_eq!(s.sessions.live_count().await, 0);
 }
