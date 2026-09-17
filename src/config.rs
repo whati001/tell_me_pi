@@ -9,8 +9,45 @@ use std::{
 use anyhow::{Context, bail};
 use serde::Deserialize;
 
-/// Tools that would let the agent change files or run commands. Rejected in `omp.tools`.
-const FORBIDDEN_TOOLS: &[&str] = &["bash", "eval", "edit", "write", "ast_edit", "task", "debug"];
+/// The only omp tools the agent may use: none of them can change files or run commands. `omp.tools` entries
+/// are normalized with [`normalize_tool`] and must be in this list.
+pub const ALLOWED_TOOLS: &[&str] = &["read", "grep", "glob", "todo"];
+
+/// omp flags the proxy sets itself (or that would widen what the agent can do). Rejected in `omp.extra_args`,
+/// both as `<flag>` and as `<flag>=<value>`.
+const RESERVED_OMP_FLAGS: &[&str] = &[
+    "--tools",
+    "--no-tools",
+    "--mode",
+    "--cwd",
+    "--session-dir",
+    "--resume",
+    "-r",
+    "--session",
+    "--continue",
+    "-c",
+    "--fork",
+    "--extension",
+    "-e",
+    "--hook",
+    "--trusted-extension",
+    "--plugin-dir",
+    "--approval-mode",
+    "--auto-approve",
+    "--yolo",
+    "--add-dir",
+    "--allow-home",
+    "--config",
+];
+
+/// Canonical tool name as omp's `--tools` parser sees it: lowercase, with the `search`/`find` aliases resolved.
+pub fn normalize_tool(name: &str) -> String {
+    match name.to_lowercase().as_str() {
+        "search" => "grep".into(),
+        "find" => "glob".into(),
+        other => other.into(),
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -145,8 +182,9 @@ pub struct RepoConfig {
 
 impl Config {
     pub fn from_toml(text: &str) -> anyhow::Result<Self> {
-        let config: Config = toml::from_str(text).context("invalid proxy config")?;
+        let mut config: Config = toml::from_str(text).context("invalid proxy config")?;
         config.validate()?;
+        config.omp.tools = config.omp.tools.iter().map(|t| normalize_tool(t)).collect();
         Ok(config)
     }
 
@@ -169,13 +207,31 @@ impl Config {
         }
         let mut names = HashSet::new();
         for p in &self.profiles {
+            for (field, value) in [("name", &p.name), ("model", &p.model)] {
+                if value.is_empty() || value.starts_with('-') {
+                    bail!("profile {field} {value:?} must be non-empty and must not start with '-'");
+                }
+            }
             if !names.insert(&p.name) {
                 bail!("duplicate profile name {:?}", p.name);
             }
         }
+        if self.sessions.max_live == 0 {
+            bail!("sessions.max_live must be at least 1");
+        }
+        if self.sessions.turn_timeout.is_zero() {
+            bail!("sessions.turn_timeout must not be zero");
+        }
         for tool in &self.omp.tools {
-            if FORBIDDEN_TOOLS.contains(&tool.as_str()) {
-                bail!("tool {tool:?} is not allowed: the agent must stay read-only");
+            let malformed = tool.contains(',') || tool.contains(char::is_whitespace);
+            if malformed || !ALLOWED_TOOLS.contains(&normalize_tool(tool).as_str()) {
+                bail!("tool {tool:?} is not allowed: the agent must stay read-only (allowed: {ALLOWED_TOOLS:?})");
+            }
+        }
+        for arg in &self.omp.extra_args {
+            let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
+            if RESERVED_OMP_FLAGS.contains(&flag) {
+                bail!("omp.extra_args must not contain {flag}: the proxy controls it");
             }
         }
         let mut repos = HashSet::new();
@@ -186,9 +242,23 @@ impl Config {
             if !repos.insert(&r.name) {
                 bail!("duplicate repo name {:?}", r.name);
             }
+            if !is_valid_repo_url(&r.url) {
+                bail!(
+                    "invalid url for repo {:?}: use an https://, http:// or file:// url without embedded credentials",
+                    r.name
+                );
+            }
         }
         Ok(())
     }
+}
+
+fn is_valid_repo_url(url: &str) -> bool {
+    let Some(rest) = ["https://", "http://", "file://"].iter().find_map(|scheme| url.strip_prefix(scheme)) else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    !authority.contains('@')
 }
 
 fn is_valid_repo_name(name: &str) -> bool {
@@ -268,6 +338,55 @@ mod tests {
     fn rejects_write_tools() {
         let err = Config::from_toml(&format!("[omp]\ntools = [\"read\", \"bash\"]\n{MINIMAL}")).unwrap_err();
         assert!(err.to_string().contains("read-only"), "{err}");
+    }
+
+    fn with_omp(omp: &str) -> anyhow::Result<Config> {
+        Config::from_toml(&format!("[omp]\n{omp}\n{MINIMAL}"))
+    }
+
+    #[test]
+    fn rejects_tools_outside_the_allowlist() {
+        for tool in ["Bash", "read,bash", " edit", "lsp", "memory_edit", "", "read bash"] {
+            let err = with_omp(&format!("tools = [{tool:?}]")).unwrap_err();
+            assert!(err.to_string().contains("read-only"), "{tool:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn normalizes_tool_aliases() {
+        let c = with_omp(r#"tools = ["Search", "FIND", "Read"]"#).unwrap();
+        assert_eq!(c.omp.tools, ["grep", "glob", "read"]);
+    }
+
+    #[test]
+    fn rejects_proxy_controlled_extra_args() {
+        for args in [r#"["--tools=bash"]"#, r#"["--extension", "x"]"#, r#"["-e", "x"]"#, r#"["--approval-mode=ask"]"#] {
+            let err = with_omp(&format!("extra_args = {args}")).unwrap_err();
+            assert!(err.to_string().contains("the proxy controls it"), "{args}: {err}");
+        }
+        with_omp(r#"extra_args = ["--no-title"]"#).unwrap();
+    }
+
+    #[test]
+    fn rejects_bad_repo_urls() {
+        for url in ["https://user:pw@github.com/x.git", "ssh://git@x/y", "git@github.com:x/y.git", "/srv/x"] {
+            let bad = format!("{MINIMAL}\n[[git.repo]]\nname = \"x\"\nurl = {url:?}\n");
+            assert!(Config::from_toml(&bad).is_err(), "{url}");
+        }
+        for url in ["https://github.com/x.git", "http://host/p@x.git", "file:///srv/x"] {
+            let ok = format!("{MINIMAL}\n[[git.repo]]\nname = \"x\"\nurl = {url:?}\n");
+            Config::from_toml(&ok).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_bad_session_limits_and_profiles() {
+        assert!(Config::from_toml(&format!("[sessions]\nmax_live = 0\n{MINIMAL}")).is_err());
+        assert!(Config::from_toml(&format!("[sessions]\nturn_timeout = \"0s\"\n{MINIMAL}")).is_err());
+        assert!(Config::from_toml("[[profile]]\nname = \"\"\nmodel = \"m\"\n").is_err());
+        assert!(Config::from_toml("[[profile]]\nname = \"a\"\nmodel = \"\"\n").is_err());
+        assert!(Config::from_toml("[[profile]]\nname = \"a\"\nmodel = \"--tools=bash\"\n").is_err());
+        assert!(Config::from_toml("[[profile]]\nname = \"-a\"\nmodel = \"m\"\n").is_err());
     }
 
     #[test]
