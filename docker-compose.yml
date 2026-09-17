@@ -1,0 +1,66 @@
+name: tell-me-where
+
+services:
+  omp-proxy:
+    build: .
+    image: tell-me-where/omp-proxy:latest
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID]   # only needed to switch from root to the omp user
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    mem_limit: 4g
+    cpus: 2
+    environment:
+      # Optional provider keys (unused with the Codex subscription login, kept for reference).
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_CODEX_OAUTH_TOKEN: ${OPENAI_CODEX_OAUTH_TOKEN:-}
+    secrets:
+      - git_token
+      - proxy_api_key
+    volumes:
+      - omp-data:/data
+      - ./proxy.toml:/etc/omp-proxy/proxy.toml:ro
+      - ./skills:/data/home/.omp/agent/skills:ro
+    expose:
+      - "8080"
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:${OPEN_WEBUI_VERSION:-main}
+    restart: unless-stopped
+    depends_on:
+      omp-proxy:
+        condition: service_healthy
+    ports:
+      - "${OPEN_WEBUI_PORT:-3000}:8080"
+    environment:
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:?set WEBUI_SECRET_KEY in .env}
+      ENABLE_OLLAMA_API: "false"
+      # First connection: the omp proxy. Second: a regular LLM for titles, tags and follow-ups.
+      OPENAI_API_BASE_URLS: "http://omp-proxy:8080/v1;${TASK_API_BASE_URL:?set TASK_API_BASE_URL in .env}"
+      OPENAI_API_KEYS: "${PROXY_API_KEY:?set PROXY_API_KEY in .env};${TASK_API_KEY:?set TASK_API_KEY in .env}"
+      TASK_MODEL_EXTERNAL: ${TASK_MODEL:?set TASK_MODEL in .env}
+      # Sends X-OpenWebUI-Chat-Id, which the proxy uses to keep one agent session per chat.
+      ENABLE_FORWARD_USER_INFO_HEADERS: "true"
+      # Put retrieved file/web context into the system prompt instead of the user message, so the
+      # proxy recognises the chat history as unchanged on follow-ups.
+      RAG_SYSTEM_CONTEXT: "true"
+      # Agent turns can be long.
+      AIOHTTP_CLIENT_TIMEOUT: "900"
+    volumes:
+      - open-webui-data:/app/backend/data
+
+secrets:
+  git_token:
+    file: ./secrets/git_token
+  proxy_api_key:
+    file: ./secrets/proxy_api_key
+
+volumes:
+  omp-data:
+  open-webui-data:

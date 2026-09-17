@@ -1,0 +1,44 @@
+# omp-proxy configuration. Copy to proxy.toml and adjust.
+
+[server]
+listen = "0.0.0.0:8080"
+# OpenWebUI must send this value as its API key (Bearer token).
+api_key_file = "/run/secrets/proxy_api_key"
+
+[sessions]
+data_dir = "/data"      # sessions/, mirrors/, index.json
+idle_timeout = "15m"    # stop idle omp processes; "0s" = one process per turn
+max_live = 8            # concurrently running omp processes
+turn_timeout = "10m"    # abort a single answer after this long
+retention = "30d"       # delete chats not used for this long
+
+[omp]
+binary = "/usr/local/bin/omp"
+# Read-only tool set. These are the only allowed tools: the proxy rejects anything else
+# (bash, eval, edit, write, ast_edit, task, debug, ...). The `repo` host tool is always added.
+tools = ["read", "grep", "glob", "todo"]
+# Flags the proxy controls itself (--tools, --mode, --cwd, --resume, --approval-mode, ...) are rejected.
+extra_args = []
+# Environment variables passed to omp when set. Kept for reference: the Codex subscription
+# login is stored in the data volume instead (see README).
+env_passthrough = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENAI_CODEX_OAUTH_TOKEN"]
+reasoning = "field"     # field (reasoning_content) | think_tags | off
+
+# Each profile is shown as a model in OpenWebUI.
+[[profile]]
+name = "omp-codex"
+model = "openai-codex/gpt-5.5"
+thinking = "medium"
+
+[git]
+# Use a read-only token (GitHub fine-grained PAT with "Contents: read").
+token_file = "/run/secrets/git_token"
+token_username = "x-access-token"   # GitLab: "oauth2"
+# Only for local development without execute-only git binaries.
+insecure_allow_exposed_token = false
+
+# https://, http:// or file:// urls without embedded credentials.
+[[git.repo]]
+name = "backend"
+url = "https://github.com/acme/backend.git"
+description = "Backend service"

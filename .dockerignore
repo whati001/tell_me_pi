@@ -1,0 +1,8 @@
+target
+.git
+secrets
+data
+docs
+tests
+*.md
+.env
