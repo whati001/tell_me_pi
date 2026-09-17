@@ -118,3 +118,16 @@ async fn corrupt_stream_is_fatal() {
         .unwrap_err();
     assert!(err.to_string().contains("not running"), "{err}");
 }
+
+#[tokio::test]
+async fn request_with_timeout_gives_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let proc = OmpProcess::spawn(spec(&dir), None).await.unwrap();
+    // the fake answers unknown commands without an id, so the request never completes
+    let started = std::time::Instant::now();
+    let err = proc.request_with_timeout(json!({"type": "no_such_command"}), Duration::from_millis(200)).await;
+    assert!(err.unwrap_err().to_string().contains("timed out"));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    proc.request(json!({"type": "get_state"})).await.unwrap();
+    proc.shutdown(Duration::from_secs(5)).await;
+}

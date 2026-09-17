@@ -32,6 +32,10 @@ async fn start(extra_sessions_config: &str) -> Server {
         name = "omp-test"
         model = "fake/model"
         thinking = "low"
+
+        [[profile]]
+        name = "omp-leaky"
+        model = "fake/leaky"
         "#,
         data = data.path().display(),
         bin = env!("CARGO_BIN_EXE_fake-omp"),
@@ -106,6 +110,7 @@ fn parse_sse(body: &str) -> Reply {
             continue;
         }
         if !v["usage"].is_null() {
+            assert!(v["id"].is_string() && v["created"].is_u64() && v["model"].is_string(), "{v}");
             reply.usage = v["usage"].clone();
         }
         let Some(choice) = v["choices"].get(0) else { continue };
@@ -215,6 +220,7 @@ async fn new_message_while_busy_aborts_previous_turn() {
     let first = slow.await.unwrap();
     assert_eq!(first.content, "partial");
     assert!(first.finished);
+    assert!(first.errors.is_empty(), "{:?}", first.errors);
 }
 
 #[tokio::test]
@@ -310,4 +316,84 @@ async fn delete_session_removes_state() {
     // history is gone: the same chat starts from scratch
     let reply = s.chat("gone", &[user("one"), assistant("x"), user("two")]).await;
     assert!(reply.content.starts_with("echo[1]: Earlier conversation"), "{}", reply.content);
+}
+
+#[tokio::test]
+async fn late_failure_after_rebuild_keeps_the_transcript() {
+    let s = start("").await;
+    let failed = s.chat("c11", &[user("first"), assistant("answer"), user("FAIL_LATE")]).await;
+    assert_eq!(failed.errors, ["No API key found for fake."]);
+    // omp stored nothing, so the earlier conversation must be sent again
+    let reply = s.chat("c11", &[user("first"), assistant("answer"), user("second")]).await;
+    assert!(reply.content.starts_with("echo[1]: Earlier conversation"), "{}", reply.content);
+}
+
+#[tokio::test]
+async fn delete_during_turn_leaves_no_index_entry() {
+    let s = Arc::new(start("").await);
+    s.chat("busy-del", &[user("one")]).await;
+    let slow = {
+        let s = s.clone();
+        tokio::spawn(async move { s.chat("busy-del", &[user("one"), assistant("x"), user("SLOW")]).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let resp = s.client.delete(format!("{}/v1/sessions/busy-del", s.url)).bearer_auth("secret").send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    slow.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let index: Value =
+        serde_json::from_str(&std::fs::read_to_string(s.data.path().join("index.json")).unwrap()).unwrap();
+    assert!(index.get("omp-test:busy-del").is_none(), "{index}");
+}
+
+#[tokio::test]
+async fn delete_matches_chat_ids_exactly() {
+    let s = start("").await;
+    s.chat("x:y", &[user("one")]).await;
+    let resp: Value = s
+        .client
+        .delete(format!("{}/v1/sessions/y", s.url))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["deleted"], 0);
+}
+
+#[tokio::test]
+async fn corrupt_index_is_set_aside() {
+    let data = tempfile::tempdir().unwrap();
+    std::fs::write(data.path().join("index.json"), "{not json").unwrap();
+    let cfg = Config::from_toml(&format!(
+        "[sessions]\ndata_dir = \"{}\"\n[[profile]]\nname = \"a\"\nmodel = \"m\"\n",
+        data.path().display()
+    ))
+    .unwrap();
+    let cfg = Arc::new(cfg);
+    let repo = Arc::new(RepoTool::new(Vec::new(), cfg.sessions.mirrors_dir(), None));
+    SessionManager::new(cfg, repo).unwrap();
+    assert!(!data.path().join("index.json").exists());
+    assert_eq!(std::fs::read_to_string(data.path().join("index.json.corrupt")).unwrap(), "{not json");
+}
+
+#[tokio::test]
+async fn tools_outside_the_read_only_set_are_refused() {
+    let s = start("").await;
+    let resp = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.url))
+        .bearer_auth("secret")
+        .header("X-OpenWebUI-Chat-Id", "leaky")
+        .json(&json!({"model": "omp-leaky", "messages": [user("hi")]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
+    let body: Value = resp.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("read-only set") && message.contains("bash"), "{message}");
+    assert_eq!(s.sessions.live_count().await, 0);
 }

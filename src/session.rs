@@ -12,10 +12,14 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, broadcast};
+use tokio::{
+    io::AsyncWriteExt,
+    sync::{Mutex, broadcast},
+};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
-    config::{Config, Profile},
+    config::{self, Config, Profile},
     history::{self, ChatMessage, ForwardedTurn, Plan},
     repo::{RepoTool, TOOL_NAME},
     rpc::{HostToolFn, OmpProcess, SpawnSpec, ToolOutcome},
@@ -25,6 +29,8 @@ use crate::{
 const BASE_ENV: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TZ", "TMPDIR", "PI_CODING_AGENT_DIR", "PI_CONFIG_DIR"];
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const IDLE_WAIT: Duration = Duration::from_secs(10);
+/// Upper bound for control commands (everything except `prompt`), so a hung omp cannot block a chat.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, thiserror::Error)]
 pub enum TurnError {
@@ -57,6 +63,10 @@ struct State {
     busy: bool,
     generation: u64,
     last_used: Instant,
+    /// Cancelled when a newer turn takes over.
+    turn_cancel: CancellationToken,
+    /// Set (under this lock) when the chat is deleted; the session is then no longer in the map.
+    removed: bool,
 }
 
 /// A running turn. Pass it back to [`SessionManager::end_turn`] when done.
@@ -65,6 +75,8 @@ pub struct Turn {
     proc: Arc<OmpProcess>,
     generation: u64,
     pub events: broadcast::Receiver<Value>,
+    /// Cancelled when a newer request for the same chat supersedes this turn.
+    pub cancelled: CancellationToken,
     /// The prompt completed without an agent run (e.g. a slash command).
     pub local_only: bool,
 }
@@ -80,8 +92,20 @@ impl SessionManager {
     pub fn new(cfg: Arc<Config>, repo: Arc<RepoTool>) -> anyhow::Result<Arc<Self>> {
         let sessions_dir = cfg.sessions.sessions_dir();
         std::fs::create_dir_all(&sessions_dir).with_context(|| format!("creating {}", sessions_dir.display()))?;
-        let index = match std::fs::read_to_string(cfg.sessions.index_path()) {
-            Ok(text) => serde_json::from_str(&text).context("corrupt session index")?,
+        let index_path = cfg.sessions.index_path();
+        let index = match std::fs::read_to_string(&index_path) {
+            Ok(text) => match serde_json::from_str(&text) {
+                Ok(index) => index,
+                Err(e) => {
+                    let corrupt = index_path.with_extension("json.corrupt");
+                    tracing::error!(
+                        "session index is corrupt ({e}); moving it to {} and starting empty",
+                        corrupt.display()
+                    );
+                    std::fs::rename(&index_path, &corrupt).context("moving the corrupt session index aside")?;
+                    HashMap::new()
+                }
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
             Err(e) => return Err(e).context("reading session index"),
         };
@@ -93,8 +117,29 @@ impl SessionManager {
         let Some(last) = turns.last() else {
             return Err(TurnError::BadRequest("the request contains no user message".into()));
         };
-        let session = self.get_or_load(key, profile).await;
+        let mut session = self.get_or_load(key, profile).await;
+        if session.state.lock().await.removed {
+            // deleted meanwhile: the map now holds (or will create) a fresh session
+            session = self.get_or_load(key, profile).await;
+        }
         let mut st = session.state.lock().await;
+        if st.removed {
+            return Err(TurnError::Unavailable("the chat was deleted while the request started, try again".into()));
+        }
+
+        if st.busy {
+            // The user moved on (stop + new message, regenerate, …): cancel the running turn first.
+            st.turn_cancel.cancel();
+            st.busy = false;
+            if let Some(proc) = st.proc.clone()
+                && proc.is_alive()
+                && let Err(e) = stop_turn(&proc).await
+            {
+                tracing::warn!(%key, "stopping the previous turn failed, restarting omp: {e:#}");
+                proc.shutdown(SHUTDOWN_GRACE).await;
+                st.proc = None;
+            }
+        }
 
         let alive = st.proc.as_ref().is_some_and(|p| p.is_alive());
         if !alive {
@@ -108,41 +153,53 @@ impl SessionManager {
         }
         let proc = st.proc.clone().expect("process spawned above");
 
-        if st.busy {
-            // The user moved on (stop + new message, regenerate, …): cancel the running turn first.
-            proc.request(json!({"type": "abort"})).await?;
-            wait_until_idle(&proc).await?;
-            st.busy = false;
-        }
-
-        let mut plan = history::plan(&st.forwarded, &turns);
-        if let Plan::BranchAt(index) = plan {
-            let resp = proc.request(json!({"type": "get_branch_messages"})).await?;
-            let entries: Vec<(String, String)> = resp["data"]["messages"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|m| Some((m["entryId"].as_str()?.to_string(), m["text"].as_str()?.to_string())))
-                .collect();
-            match history::find_entry(&st.forwarded, index, &entries) {
-                Some(entry_id) => {
-                    proc.request(json!({"type": "branch", "entryId": entry_id})).await?;
-                    st.forwarded.truncate(index);
-                }
-                None => plan = Plan::Rebuild,
-            }
-        }
-        let message = match plan {
-            Plan::Prompt | Plan::BranchAt(_) => last.text.clone(),
-            Plan::Rebuild => {
-                if !st.forwarded.is_empty() {
-                    proc.request(json!({"type": "new_session"})).await?;
-                }
-                st.forwarded = turns[..turns.len() - 1]
-                    .iter()
-                    .map(|t| ForwardedTurn { hash: t.hash.clone(), sent_text: None })
+        // `synced` tracks what omp holds after each successful command; `forwarded` becomes the new state
+        // only once the prompt is accepted.
+        let mut synced = st.forwarded.clone();
+        let mut forwarded = synced.clone();
+        let prepared = async {
+            let mut plan = history::plan(&forwarded, &turns);
+            if let Plan::BranchAt(index) = plan {
+                let resp = control(&proc, json!({"type": "get_branch_messages"})).await?;
+                let entries: Vec<(String, String)> = resp["data"]["messages"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|m| Some((m["entryId"].as_str()?.to_string(), m["text"].as_str()?.to_string())))
                     .collect();
-                history::rebuild_prompt(messages, last)
+                match history::find_entry(&forwarded, index, &entries) {
+                    Some(entry_id) => {
+                        control(&proc, json!({"type": "branch", "entryId": entry_id})).await?;
+                        forwarded.truncate(index);
+                        synced.truncate(index);
+                    }
+                    None => plan = Plan::Rebuild,
+                }
+            }
+            anyhow::Ok(match plan {
+                Plan::Prompt | Plan::BranchAt(_) => last.text.clone(),
+                Plan::Rebuild => {
+                    if !forwarded.is_empty() {
+                        control(&proc, json!({"type": "new_session"})).await?;
+                        synced.clear();
+                    }
+                    forwarded = turns[..turns.len() - 1]
+                        .iter()
+                        .map(|t| ForwardedTurn { hash: t.hash.clone(), sent_text: None })
+                        .collect();
+                    history::rebuild_prompt(messages, last)
+                }
+            })
+        }
+        .await;
+        let message = match prepared {
+            Ok(message) => message,
+            Err(e) => {
+                // omp did not answer a control command in time (or failed it): start over next time.
+                proc.shutdown(SHUTDOWN_GRACE).await;
+                st.proc = None;
+                st.forwarded = synced;
+                return Err(e.into());
             }
         };
 
@@ -151,12 +208,24 @@ impl SessionManager {
         if !last.images.is_empty() {
             prompt["images"] = json!(last.images);
         }
-        let ack = proc.request(prompt).await?;
-        st.forwarded.push(ForwardedTurn { hash: last.hash.clone(), sent_text: Some(message) });
+        let ack = match proc.request(prompt).await {
+            Ok(ack) => ack,
+            Err(e) => {
+                st.forwarded = synced;
+                if !proc.is_alive() {
+                    st.proc = None;
+                }
+                return Err(e.into());
+            }
+        };
+        forwarded.push(ForwardedTurn { hash: last.hash.clone(), sent_text: Some(message) });
+        st.forwarded = forwarded;
+        st.turn_cancel = CancellationToken::new();
         st.generation += 1;
         st.busy = true;
         st.last_used = Instant::now();
         let generation = st.generation;
+        let cancelled = st.turn_cancel.clone();
         drop(st);
 
         Ok(Turn {
@@ -164,6 +233,7 @@ impl SessionManager {
             proc,
             generation,
             events,
+            cancelled,
             local_only: ack["data"]["agentInvoked"] == false,
         })
     }
@@ -175,28 +245,22 @@ impl SessionManager {
         if st.generation != turn.generation {
             return; // a newer turn took over
         }
-        if aborted && turn.proc.is_alive() {
-            let _ = turn.proc.request(json!({"type": "abort"})).await;
-        }
         st.busy = false;
         st.last_used = Instant::now();
-        // A prompt can be acknowledged and still fail before omp stores it (e.g. missing login).
-        if turn.proc.is_alive()
-            && let Some(sent) = st.forwarded.last().and_then(|t| t.sent_text.clone())
-            && let Ok(resp) = turn.proc.request(json!({"type": "get_branch_messages"})).await
-            && resp["data"]["messages"].as_array().and_then(|m| m.last()).map(|m| &m["text"]) != Some(&json!(sent))
-        {
-            st.forwarded.pop();
+        if st.removed {
+            return;
         }
-        if let Ok(state) = turn.proc.request(json!({"type": "get_state"})).await
-            && let Some(file) = state["data"]["sessionFile"].as_str()
+        let proc = turn.proc;
+        if proc.is_alive()
+            && let Err(e) = sync_after_turn(&proc, &mut st, aborted).await
         {
-            st.session_file = Some(file.to_string());
+            tracing::warn!(key = %session.key, "omp did not respond after the turn, stopping it: {e:#}");
+            proc.shutdown(SHUTDOWN_GRACE).await;
         }
-        if !turn.proc.is_alive() {
+        if !proc.is_alive() {
             st.proc = None;
         } else if self.cfg.sessions.idle_timeout.is_zero() {
-            turn.proc.shutdown(SHUTDOWN_GRACE).await;
+            proc.shutdown(SHUTDOWN_GRACE).await;
             st.proc = None;
         }
         let entry = IndexEntry {
@@ -233,22 +297,29 @@ impl SessionManager {
         };
         for key in expired {
             let live = self.sessions.lock().await.get(&key).cloned();
-            if let Some(session) = live
-                && session.state.try_lock().map(|st| st.proc.is_some()).unwrap_or(true)
-            {
-                continue;
+            match live {
+                Some(session) => {
+                    let Ok(mut st) = session.state.try_lock() else { continue };
+                    if st.proc.is_some() || st.busy || st.removed {
+                        continue;
+                    }
+                    tracing::info!(%key, "removing expired chat");
+                    self.remove_locked(&session, &mut st).await;
+                }
+                None => {
+                    tracing::info!(%key, "removing expired chat");
+                    self.remove(&key).await;
+                }
             }
-            tracing::info!(%key, "removing expired chat");
-            self.remove(&key).await;
         }
     }
 
     /// Deletes every session of `chat_id` (all profiles). Returns how many were removed.
     pub async fn delete_chat(&self, chat_id: &str) -> usize {
-        let suffix = format!(":{chat_id}");
-        let mut keys: Vec<String> = self.index.lock().await.keys().filter(|k| k.ends_with(&suffix)).cloned().collect();
+        let matches = |key: &str| key.split_once(':').is_some_and(|(_, c)| c == chat_id);
+        let mut keys: Vec<String> = self.index.lock().await.keys().filter(|k| matches(k)).cloned().collect();
         for key in self.sessions.lock().await.keys() {
-            if key.ends_with(&suffix) && !keys.contains(key) {
+            if matches(key) && !keys.contains(key) {
                 keys.push(key.clone());
             }
         }
@@ -278,19 +349,42 @@ impl SessionManager {
     }
 
     async fn remove(&self, key: &str) {
-        let session = self.sessions.lock().await.remove(key);
-        if let Some(session) = &session {
-            let proc = session.state.lock().await.proc.take();
-            if let Some(proc) = proc {
-                proc.shutdown(SHUTDOWN_GRACE).await;
+        // Work under the session's state lock so no turn can start (and spawn into the directory) meanwhile. A
+        // chat without a live session gets a removed placeholder for the duration.
+        let session = {
+            let mut sessions = self.sessions.lock().await;
+            sessions
+                .entry(key.to_string())
+                .or_insert_with(|| self.new_session(key, None, IndexEntry::default()))
+                .clone()
+        };
+        let mut st = session.state.lock().await;
+        // Someone else removed it while we waited (and a new session may already use the directory).
+        let current = self.sessions.lock().await.get(key).is_some_and(|s| Arc::ptr_eq(s, &session));
+        if current {
+            self.remove_locked(&session, &mut st).await;
+        }
+    }
+
+    /// Deletes a chat. `st` is the locked state of `session`.
+    async fn remove_locked(&self, session: &Arc<Session>, st: &mut State) {
+        st.removed = true;
+        st.turn_cancel.cancel();
+        if let Some(proc) = st.proc.take() {
+            proc.shutdown(SHUTDOWN_GRACE).await;
+        }
+        let _ = tokio::fs::remove_dir_all(&session.dir).await;
+        {
+            let mut index = self.index.lock().await;
+            if index.remove(&session.key).is_some()
+                && let Err(e) = self.save_index(&index).await
+            {
+                tracing::error!("saving session index failed: {e:#}");
             }
         }
-        let _ = tokio::fs::remove_dir_all(self.session_dir(key)).await;
-        let mut index = self.index.lock().await;
-        if index.remove(key).is_some()
-            && let Err(e) = self.save_index(&index).await
-        {
-            tracing::error!("saving session index failed: {e:#}");
+        let mut sessions = self.sessions.lock().await;
+        if sessions.get(&session.key).is_some_and(|s| Arc::ptr_eq(s, session)) {
+            sessions.remove(&session.key);
         }
     }
 
@@ -304,10 +398,18 @@ impl SessionManager {
             return s.clone();
         }
         let saved = self.index.lock().await.get(key).cloned().unwrap_or_default();
-        let session = Arc::new(Session {
+        let session = self.new_session(key, Some(profile), saved);
+        sessions.insert(key.to_string(), session.clone());
+        session
+    }
+
+    /// A session without a profile is a placeholder that is marked removed and never runs.
+    fn new_session(&self, key: &str, profile: Option<&Profile>, saved: IndexEntry) -> Arc<Session> {
+        let placeholder = Profile { name: String::new(), model: String::new(), thinking: None };
+        Arc::new(Session {
             key: key.to_string(),
             dir: self.session_dir(key),
-            profile: profile.clone(),
+            profile: profile.cloned().unwrap_or(placeholder),
             state: Mutex::new(State {
                 proc: None,
                 forwarded: saved.forwarded,
@@ -315,10 +417,10 @@ impl SessionManager {
                 busy: false,
                 generation: 0,
                 last_used: Instant::now(),
+                turn_cancel: CancellationToken::new(),
+                removed: profile.is_none(),
             }),
-        });
-        sessions.insert(key.to_string(), session.clone());
-        session
+        })
     }
 
     fn session_dir(&self, key: &str) -> PathBuf {
@@ -349,10 +451,17 @@ impl SessionManager {
         if live < self.cfg.sessions.max_live {
             return Ok(());
         }
-        let Some((_, victim)) = candidate else {
-            return Err(TurnError::Unavailable("too many active conversations, try again later".into()));
+        let busy = || TurnError::Unavailable("too many active conversations, try again later".into());
+        let Some((last_used, victim)) = candidate else { return Err(busy()) };
+        // The victim may have started a turn since the scan; never wait for its lock while holding ours.
+        let proc = {
+            let Ok(mut st) = victim.state.try_lock() else { return Err(busy()) };
+            let alive = st.proc.as_ref().is_some_and(|p| p.is_alive());
+            if st.busy || !alive || st.last_used != last_used {
+                return Err(busy());
+            }
+            st.proc.take()
         };
-        let proc = victim.state.lock().await.proc.take();
         if let Some(proc) = proc {
             tracing::info!(key = %victim.key, "stopping omp process to make room");
             proc.shutdown(SHUTDOWN_GRACE).await;
@@ -417,26 +526,99 @@ impl SessionManager {
 
         let spec = SpawnSpec { binary: omp.binary.clone(), args, cwd: workdir, env };
         let proc = OmpProcess::spawn(spec, Some(handler)).await?;
-        proc.request(json!({"type": "set_host_tools", "tools": [self.repo.definition()]})).await?;
-        let state = proc.request(json!({"type": "get_state"})).await?;
+        let state = match self.configure(&proc).await {
+            Ok(state) => state,
+            Err(e) => {
+                proc.shutdown(SHUTDOWN_GRACE).await;
+                return Err(e);
+            }
+        };
         let file = state["data"]["sessionFile"].as_str().map(String::from);
         tracing::info!(key = %session.key, resumed = resume.is_some(), "started omp process");
         Ok((proc, file))
     }
 
+    /// Registers the host tools and checks that omp enabled only read-only tools. Returns the `get_state`
+    /// response.
+    async fn configure(&self, proc: &OmpProcess) -> anyhow::Result<Value> {
+        control(proc, json!({"type": "set_host_tools", "tools": [self.repo.definition()]})).await?;
+        let state = control(proc, json!({"type": "get_state"})).await?;
+        let unexpected: Vec<&str> = state["data"]["dumpTools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|t| t["name"].as_str().unwrap_or("<unnamed>"))
+            .filter(|name| *name != TOOL_NAME && !config::ALLOWED_TOOLS.contains(name))
+            .collect();
+        anyhow::ensure!(
+            unexpected.is_empty(),
+            "omp enabled tools outside the read-only set: {}",
+            unexpected.join(", ")
+        );
+        Ok(state)
+    }
+
+    /// Replaces the index file atomically and durably.
     async fn save_index(&self, index: &HashMap<String, IndexEntry>) -> anyhow::Result<()> {
         let path = self.cfg.sessions.index_path();
         let tmp = path.with_extension("json.tmp");
-        tokio::fs::write(&tmp, serde_json::to_vec_pretty(index)?).await?;
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        file.write_all(&serde_json::to_vec_pretty(index)?).await?;
+        file.sync_all().await?;
+        drop(file);
         tokio::fs::rename(&tmp, &path).await?;
+        if let Some(dir) = path.parent()
+            && let Ok(dir) = tokio::fs::File::open(dir).await
+        {
+            let _ = dir.sync_all().await;
+        }
         Ok(())
     }
+}
+
+async fn control(proc: &OmpProcess, command: Value) -> anyhow::Result<Value> {
+    proc.request_with_timeout(command, CONTROL_TIMEOUT).await
+}
+
+/// Aborts the running turn and waits until omp is idle.
+async fn stop_turn(proc: &OmpProcess) -> anyhow::Result<()> {
+    control(proc, json!({"type": "abort"})).await?;
+    wait_until_idle(proc).await
+}
+
+/// Brings `st` in line with what omp stored for the finished turn.
+async fn sync_after_turn(proc: &OmpProcess, st: &mut State, aborted: bool) -> anyhow::Result<()> {
+    if aborted {
+        control(proc, json!({"type": "abort"})).await?;
+    }
+    // A prompt can be acknowledged and still fail before omp stores it (e.g. missing login).
+    let resp = control(proc, json!({"type": "get_branch_messages"})).await?;
+    let stored = resp["data"]["messages"].as_array().map(Vec::as_slice).unwrap_or_default();
+    match stored.last() {
+        None => st.forwarded.clear(),
+        Some(last) => {
+            if let Some(sent) = st.forwarded.last().and_then(|t| t.sent_text.as_deref())
+                && last["text"].as_str() != Some(sent)
+            {
+                st.forwarded.pop();
+                // Only rebuild placeholders are left: omp does not hold them.
+                if !st.forwarded.iter().any(|t| t.sent_text.is_some()) {
+                    st.forwarded.clear();
+                }
+            }
+        }
+    }
+    let state = control(proc, json!({"type": "get_state"})).await?;
+    if let Some(file) = state["data"]["sessionFile"].as_str() {
+        st.session_file = Some(file.to_string());
+    }
+    Ok(())
 }
 
 async fn wait_until_idle(proc: &OmpProcess) -> anyhow::Result<()> {
     let deadline = Instant::now() + IDLE_WAIT;
     loop {
-        let state = proc.request(json!({"type": "get_state"})).await?;
+        let state = control(proc, json!({"type": "get_state"})).await?;
         if state["data"]["isStreaming"] != true {
             return Ok(());
         }

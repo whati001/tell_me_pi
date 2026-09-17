@@ -160,7 +160,9 @@ impl TurnRun {
                     self.buf.clear();
                     let aborted = matches!(out, Out::Error(_));
                     if let Some(turn) = self.turn.take() {
-                        self.sessions.end_turn(turn, aborted).await;
+                        // A separate task, so a client disconnect cannot cancel it half-way.
+                        let sessions = self.sessions.clone();
+                        let _ = tokio::spawn(async move { sessions.end_turn(turn, aborted).await }).await;
                     }
                 }
                 return Some(out);
@@ -182,6 +184,8 @@ impl TurnRun {
                 _ = tokio::time::sleep_until(self.deadline) => {
                     self.buf.push_back(Out::Error("the turn timed out".into()));
                 }
+                // superseded by a newer request for the same chat
+                _ = turn.cancelled.cancelled() => self.buf.push_back(Out::Done),
             }
         }
     }
@@ -193,9 +197,11 @@ impl TurnRun {
 
 impl Drop for TurnRun {
     fn drop(&mut self) {
-        if let Some(turn) = self.turn.take() {
+        if let Some(turn) = self.turn.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
             let sessions = self.sessions.clone();
-            tokio::spawn(async move { sessions.end_turn(turn, true).await });
+            runtime.spawn(async move { sessions.end_turn(turn, true).await });
         }
     }
 }
@@ -207,12 +213,19 @@ fn unix_now() -> u64 {
 fn stream_response(mut run: TurnRun, model: String) -> Response {
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
     let created = unix_now();
-    let chunk = move |delta: Value, finish: Option<&str>| {
-        let v = json!({
-            "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]
-        });
+    let base = json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model});
+    let with_base = move |fields: Value| {
+        let mut v = base.clone();
+        for (k, field) in fields.as_object().into_iter().flatten() {
+            v[k] = field.clone();
+        }
         Ok::<_, Infallible>(Event::default().data(v.to_string()))
+    };
+    let chunk = {
+        let with_base = with_base.clone();
+        move |delta: Value, finish: Option<&str>| {
+            with_base(json!({"choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}))
+        }
     };
     let stream = async_stream::stream! {
         yield chunk(json!({"role": "assistant", "content": ""}), None);
@@ -222,8 +235,7 @@ fn stream_response(mut run: TurnRun, model: String) -> Response {
                 Out::Reasoning(text) => yield chunk(json!({"reasoning_content": text}), None),
                 Out::Done => {
                     yield chunk(json!({}), Some("stop"));
-                    let usage = json!({"object": "chat.completion.chunk", "choices": [], "usage": run.usage()});
-                    yield Ok(Event::default().data(usage.to_string()));
+                    yield with_base(json!({"choices": [], "usage": run.usage()}));
                 }
                 Out::Error(message) => {
                     let err = json!({"error": {"message": message, "type": "agent_error"}});

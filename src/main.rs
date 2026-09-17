@@ -15,6 +15,8 @@ use tell_me_where::{
 const DEFAULT_CONFIG: &str = "/etc/omp-proxy/proxy.toml";
 const DEFAULT_USER: &str = "omp";
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
+/// How long open requests may continue after a shutdown signal.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -57,7 +59,22 @@ async fn serve(cfg: Arc<Config>, api_key: Option<String>, git_token: Option<Stri
         .await
         .with_context(|| format!("binding {}", cfg.server.listen))?;
     tracing::info!("listening on {}", cfg.server.listen);
-    axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
+    let stopping = Arc::new(tokio::sync::Notify::new());
+    let signal = {
+        let stopping = stopping.clone();
+        async move {
+            shutdown_signal().await;
+            stopping.notify_one();
+        }
+    };
+    let server = axum::serve(listener, app).with_graceful_shutdown(signal);
+    tokio::select! {
+        result = server => result?,
+        _ = async {
+            stopping.notified().await;
+            tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
+        } => tracing::warn!("open requests did not finish in time; stopping anyway"),
+    }
     sessions.shutdown_all().await;
     Ok(())
 }
@@ -89,14 +106,17 @@ fn read_secret(path: Option<&Path>) -> anyhow::Result<Option<String>> {
 
 /// Switches from root to `user` (when started as root) and marks the process non-dumpable,
 /// so omp children running as the same user cannot read our memory or `/proc/<pid>/environ`.
+///
+/// `HOME` is left as is: it comes from the image (and is where omp keeps its login and settings).
 fn drop_privileges(user: &str) -> anyhow::Result<()> {
-    use nix::unistd::{Uid, User, setgid, setgroups, setuid};
+    use nix::unistd::{Gid, Uid, User, setegid, setgid, setgroups, setuid};
     if Uid::effective().is_root() {
         let u = User::from_name(user)?.with_context(|| format!("user {user:?} does not exist"))?;
         setgroups(&[u.gid]).context("setgroups")?;
         setgid(u.gid).context("setgid")?;
         setuid(u.uid).context("setuid")?;
         anyhow::ensure!(setuid(Uid::from_raw(0)).is_err(), "privilege drop failed");
+        anyhow::ensure!(setegid(Gid::from_raw(0)).is_err(), "privilege drop failed (group)");
         tracing::info!("running as user {user}");
     }
     nix::sys::prctl::set_dumpable(false).context("prctl(PR_SET_DUMPABLE)")?;

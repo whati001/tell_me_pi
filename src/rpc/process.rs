@@ -175,7 +175,12 @@ impl OmpProcess {
     }
 
     /// Sends a command and waits for its response. Fails on `success: false`.
-    pub async fn request(&self, mut command: Value) -> anyhow::Result<Value> {
+    pub async fn request(&self, command: Value) -> anyhow::Result<Value> {
+        self.request_with_timeout(command, REQUEST_TIMEOUT).await
+    }
+
+    /// Like [`request`](Self::request), but gives up after `timeout`.
+    pub async fn request_with_timeout(&self, mut command: Value, timeout: Duration) -> anyhow::Result<Value> {
         let id = format!("px-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
         command["id"] = Value::String(id.clone());
         let (tx, rx) = oneshot::channel();
@@ -190,7 +195,7 @@ impl OmpProcess {
             self.pending.lock().await.remove(&id);
             return Err(e);
         }
-        let response = match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+        let response = match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => bail!("omp exited while waiting for a response"),
             Err(_) => {

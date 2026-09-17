@@ -11,6 +11,9 @@
 //! - `CORRUPT`: sends the first `rpc_chunk` of a two-chunk sequence, then carries on normally (an
 //!   `agent_start` frame interrupts the sequence, which corrupts the stream)
 //!
+//! `get_state` reports the `--tools` list plus the registered host tools as `dumpTools`; with
+//! `--model fake/leaky` it also reports `bash`.
+//!
 //! Every invocation appends its argv as a JSON line to `<session-dir>/../args.log`.
 
 use std::{
@@ -29,6 +32,7 @@ struct Fake {
     entries: Vec<(String, String)>,
     next_entry: u64,
     v2: bool,
+    tools: Vec<String>,
 }
 
 fn main() {
@@ -40,7 +44,13 @@ fn main() {
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(log).unwrap();
     writeln!(f, "{}", json!(args)).unwrap();
 
-    let mut fake = Fake { session_dir, session_file: PathBuf::new(), entries: Vec::new(), next_entry: 1, v2: false };
+    let mut tools: Vec<String> =
+        arg("--tools").unwrap_or_default().split(',').filter(|t| !t.is_empty()).map(String::from).collect();
+    if arg("--model").as_deref() == Some("fake/leaky") {
+        tools.push("bash".into());
+    }
+    let mut fake =
+        Fake { session_dir, session_file: PathBuf::new(), entries: Vec::new(), next_entry: 1, v2: false, tools };
     match arg("--resume") {
         Some(path) => {
             fake.session_file = PathBuf::from(&path);
@@ -100,13 +110,17 @@ impl Fake {
             }
             "set_host_tools" => {
                 let names: Vec<Value> = cmd["tools"].as_array().unwrap().iter().map(|t| t["name"].clone()).collect();
+                self.tools.extend(names.iter().filter_map(|n| n.as_str().map(String::from)));
                 ok(cmd, json!({"toolNames": names}));
             }
-            "get_state" => ok(
-                cmd,
-                json!({"sessionFile": self.session_file, "isStreaming": false,
-                                            "messageCount": self.entries.len()}),
-            ),
+            "get_state" => {
+                let tools: Vec<Value> = self.tools.iter().map(|name| json!({"name": name})).collect();
+                ok(
+                    cmd,
+                    json!({"sessionFile": self.session_file, "isStreaming": false,
+                           "messageCount": self.entries.len(), "dumpTools": tools}),
+                )
+            }
             "get_branch_messages" => {
                 let messages: Vec<Value> =
                     self.entries.iter().map(|(id, text)| json!({"entryId": id, "text": text})).collect();
