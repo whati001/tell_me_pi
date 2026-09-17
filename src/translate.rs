@@ -103,9 +103,13 @@ impl Translator {
             }
             "response" if ev["success"] == false => {
                 let err = ev["error"].as_str().unwrap_or("omp command failed");
+                self.close_think(&mut out);
                 out.push(Out::Error(err.to_string()));
             }
-            t if t == PROCESS_EXIT_EVENT => out.push(Out::Error("the agent process exited unexpectedly".into())),
+            t if t == PROCESS_EXIT_EVENT => {
+                self.close_think(&mut out);
+                out.push(Out::Error("the agent process exited unexpectedly".into()));
+            }
             _ => {}
         }
         out
@@ -156,10 +160,10 @@ fn tool_details(ev: &Value, summary: &str) -> String {
         .as_array()
         .map(|parts| parts.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n"))
         .unwrap_or_default();
-    format!(
-        "\n<details>\n<summary>{mark} {summary}</summary>\n\n```\n{}\n```\n</details>\n\n",
-        truncate(&text, MAX_TOOL_OUTPUT).replace("```", "ˋˋˋ")
-    )
+    // Neither part may close the surrounding HTML block or code fence.
+    let summary = summary.replace('<', "&lt;").replace('>', "&gt;").replace(['\r', '\n'], " ");
+    let text = truncate(&text, MAX_TOOL_OUTPUT).replace("```", "ˋˋˋ").replace("</details", "&lt;/details");
+    format!("\n<details>\n<summary>{mark} {summary}</summary>\n\n```\n{text}\n```\n</details>\n\n")
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -243,5 +247,34 @@ mod tests {
         let Out::Content(html) = &t.on_event(&end)[0] else { panic!() };
         assert!(html.contains("<summary>✓ grep fn main in src</summary>"), "{html}");
         assert!(html.contains("src/main.rs:1"), "{html}");
+    }
+
+    #[test]
+    fn tool_output_cannot_break_out_of_details() {
+        let mut t = Translator::new(ReasoningMode::Off);
+        let start = json!({"type": "tool_execution_start", "toolCallId": "t1", "toolName": "grep",
+                           "args": {"pattern": "a<b>\n</summary>", "path": "src"}});
+        t.on_event(&start);
+        let end = json!({"type": "tool_execution_end", "toolCallId": "t1", "toolName": "grep", "isError": false,
+                         "result": {"content": [{"type": "text", "text": "x</details><img src=y>\n```\nz"}]}});
+        let Out::Content(html) = &t.on_event(&end)[0] else { panic!() };
+        assert_eq!(html.matches("</details").count(), 1, "{html}");
+        assert!(html.contains("x&lt;/details><img src=y>"), "{html}");
+        assert_eq!(html.matches("```").count(), 2, "{html}");
+        assert!(html.contains("<summary>✓ grep a&lt;b&gt; &lt;/summary&gt; in src</summary>"), "{html}");
+    }
+
+    #[test]
+    fn errors_close_an_open_think_block() {
+        let fail = json!({"type": "response", "command": "prompt", "success": false, "error": "boom"});
+        let exit = json!({"type": PROCESS_EXIT_EVENT});
+        for ev in [fail, exit] {
+            let mut t = Translator::new(ReasoningMode::ThinkTags);
+            t.on_event(&delta("thinking_delta", "hm"));
+            let out = t.on_event(&ev);
+            assert_eq!(out[0], Out::Content("\n</think>\n\n".into()), "{ev}");
+            assert!(matches!(out[1], Out::Error(_)), "{ev}");
+            assert_eq!(out.len(), 2);
+        }
     }
 }
